@@ -1,0 +1,197 @@
+using System;
+using System.Diagnostics;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Text;
+class Program
+{
+    static void Main(string[] args)
+    {
+        string target = null;
+        bool resolveNames = false;
+        if (args.Length > 0)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "-n" || args[i] == "--resolve-names")
+                {
+                    resolveNames = true;
+                }
+                else if (args[i] == "--help" || args[i] == "-h")
+                {
+                    PrintHelp();
+                    return;
+                }
+                else
+                {
+                    target = args[i];
+                }
+            }
+        }
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            Console.WriteLine("=== Simple Traceroute Tool ===");
+            Console.WriteLine();
+            Console.Write("Enter target IP address or hostname: ");
+            target = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(target))
+            {
+                Console.WriteLine("No target specified. Exiting...");
+                return;
+            }
+            Console.Write("Resolve IP addresses to hostnames? (y/n): ");
+            string response = Console.ReadLine()?.Trim().ToLowerInvariant();
+            resolveNames = response == "y" || response == "yes";
+            Console.WriteLine();
+        }
+        try
+        {
+            IPAddress targetIP = ResolveTarget(target);
+            Console.WriteLine($"Tracing route to {target} [{targetIP}]");
+            Console.WriteLine("over a maximum of 30 hops:\n");
+            TraceRoute(targetIP, resolveNames);
+            Console.WriteLine("\nTrace complete.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\nError: {ex.Message}");
+        }
+        Console.WriteLine("\nPress any key to exit...");
+        Console.ReadKey();
+    }
+    static IPAddress ResolveTarget(string target)
+    {
+        if (IPAddress.TryParse(target, out IPAddress ipAddress))
+        {
+            return ipAddress;
+        }
+        try
+        {
+            IPHostEntry hostEntry = Dns.GetHostEntry(target);
+            foreach (IPAddress addr in hostEntry.AddressList)
+            {
+                if (addr.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    return addr;
+                }
+            }
+            throw new Exception("No IPv4 address found for target.");
+        }
+        catch (SocketException)
+        {
+            throw new Exception($"Unable to resolve hostname: {target}");
+        }
+    }
+    static void TraceRoute(IPAddress targetIP, bool resolveNames)
+    {
+        const int maxHops = 30;
+        const int timeoutMs = 3000;
+        const int probesPerHop = 3;
+        byte[] buffer = Encoding.ASCII.GetBytes("CursorTraceroutePayload");
+
+        using var ping = new Ping();
+
+        for (int ttl = 1; ttl <= maxHops; ttl++)
+        {
+            Console.Write($"{ttl,2}  ");
+
+            long?[] rtts = new long?[probesPerHop];
+            IPAddress hopAddress = null;
+            bool reachedTarget = false;
+
+            for (int i = 0; i < probesPerHop; i++)
+            {
+                try
+                {
+                    var options = new PingOptions(ttl, true);
+
+                    var sw = Stopwatch.StartNew();
+                    PingReply reply = ping.Send(targetIP, timeoutMs, buffer, options);
+                    sw.Stop();
+
+                    if (reply.Status == IPStatus.Success || reply.Status == IPStatus.TtlExpired)
+                    {
+                        rtts[i] = Math.Max(1, sw.ElapsedMilliseconds);
+
+                        if (reply.Address != null)
+                            hopAddress = reply.Address;
+
+                        if (reply.Status == IPStatus.Success)
+                            reachedTarget = true;
+                    }
+                    else
+                    {
+                        rtts[i] = null;
+                    }
+                }
+                catch
+                {
+                    rtts[i] = null;
+                }
+            }
+
+            for (int i = 0; i < probesPerHop; i++)
+            {
+                if (rtts[i].HasValue)
+                    Console.Write($"  {rtts[i].Value} ms");
+                else
+                    Console.Write("  *");
+            }
+
+            Console.Write("  ");
+
+            if (hopAddress != null)
+            {
+                string ip = hopAddress.ToString();
+
+                if (resolveNames)
+                {
+                    string name = GetHostname(hopAddress);
+
+                    if (!string.Equals(name, ip, StringComparison.OrdinalIgnoreCase))
+                        Console.WriteLine($"{name} [{ip}]");
+                    else
+                        Console.WriteLine(ip);
+                }
+                else
+                {
+                    Console.WriteLine(ip);
+                }
+            }
+            else
+            {
+                Console.WriteLine("Request timed out.");
+            }
+
+            if (reachedTarget)
+                break;
+        }
+    }
+    static string GetHostname(IPAddress address)
+    {
+        try
+        {
+            return Dns.GetHostEntry(address).HostName;
+        }
+        catch
+        {
+            return address.ToString();
+        }
+    }
+    static void PrintHelp()
+    {
+        Console.WriteLine("Simple Traceroute Tool");
+        Console.WriteLine("======================");
+        Console.WriteLine();
+        Console.WriteLine("Usage: mytraceroute [target] [options]");
+        Console.WriteLine();
+        Console.WriteLine("Options:");
+        Console.WriteLine("  -n, --resolve-names    Resolve IP addresses to hostnames");
+        Console.WriteLine("  --help, -h             Show this help message");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  mytraceroute 8.8.8.8");
+        Console.WriteLine("  mytraceroute google.com -n");
+    }
+}
