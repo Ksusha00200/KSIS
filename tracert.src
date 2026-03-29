@@ -1,197 +1,235 @@
 using System;
 using System.Diagnostics;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
-class Program
+using System.Threading;
+
+internal static class Program
 {
-    static void Main(string[] args)
+    private static readonly ushort _icmpId = (ushort)(Environment.ProcessId & 0xFFFF);
+    private static int _seq;
+
+    private static int Main(string[] args)
     {
-        string target = null;
-        bool resolveNames = false;
-        if (args.Length > 0)
+        if (args.Length == 0 || args[0] == "--help" || args[0] == "-?")
         {
-            for (int i = 0; i < args.Length; i++)
-            {
-                if (args[i] == "-n" || args[i] == "--resolve-names")
-                {
-                    resolveNames = true;
-                }
-                else if (args[i] == "--help" || args[i] == "-h")
-                {
-                    PrintHelp();
-                    return;
-                }
-                else
-                {
-                    target = args[i];
-                }
-            }
+            PrintHelp();
+            return args.Length == 0 ? 2 : 0;
         }
-        if (string.IsNullOrWhiteSpace(target))
-        {
-            Console.WriteLine("=== Simple Traceroute Tool ===");
-            Console.WriteLine();
-            Console.Write("Enter target IP address or hostname: ");
-            target = Console.ReadLine()?.Trim();
-            if (string.IsNullOrWhiteSpace(target))
-            {
-                Console.WriteLine("No target specified. Exiting...");
-                return;
-            }
-            Console.Write("Resolve IP addresses to hostnames? (y/n): ");
-            string response = Console.ReadLine()?.Trim().ToLowerInvariant();
-            resolveNames = response == "y" || response == "yes";
-            Console.WriteLine();
-        }
+
+        bool resolve = !(args.Length > 1 && args[1] == "-d");
+        string target = args[0];
+
         try
         {
-            IPAddress targetIP = ResolveTarget(target);
-            Console.WriteLine($"Tracing route to {target} [{targetIP}]");
-            Console.WriteLine("over a maximum of 30 hops:\n");
-            TraceRoute(targetIP, resolveNames);
-            Console.WriteLine("\nTrace complete.");
+            var targetIp = IPAddress.TryParse(target, out var ip) ? ip : Dns.GetHostEntry(target).AddressList[0];
+            Console.WriteLine($"Трассировка маршрута к {target} [{targetIp}]\nс максимальным числом прыжков 30:\n");
+            Traceroute(targetIp, resolve);
+            return 0;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\nError: {ex.Message}");
-        }
-        Console.WriteLine("\nPress any key to exit...");
-        Console.ReadKey();
-    }
-    static IPAddress ResolveTarget(string target)
-    {
-        if (IPAddress.TryParse(target, out IPAddress ipAddress))
-        {
-            return ipAddress;
-        }
-        try
-        {
-            IPHostEntry hostEntry = Dns.GetHostEntry(target);
-            foreach (IPAddress addr in hostEntry.AddressList)
-            {
-                if (addr.AddressFamily == AddressFamily.InterNetwork)
-                {
-                    return addr;
-                }
-            }
-            throw new Exception("No IPv4 address found for target.");
-        }
-        catch (SocketException)
-        {
-            throw new Exception($"Unable to resolve hostname: {target}");
+            Console.Error.WriteLine($"\nОшибка: {ex.Message}");
+            return 1;
         }
     }
-    static void TraceRoute(IPAddress targetIP, bool resolveNames)
+
+    private static void Traceroute(IPAddress target, bool resolveNames)
     {
-        const int maxHops = 30;
-        const int timeoutMs = 3000;
-        const int probesPerHop = 3;
-        byte[] buffer = Encoding.ASCII.GetBytes("CursorTraceroutePayload");
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ProtocolType.Icmp);
+        socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        socket.ReceiveBufferSize = 512 * 1024;
 
-        using var ping = new Ping();
+        var targetEp = new IPEndPoint(target, 0);
 
-        for (int ttl = 1; ttl <= maxHops; ttl++)
+        for (int ttl = 1; ttl <= 30; ttl++)
         {
-            Console.Write($"{ttl,2}  ");
+            socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.IpTimeToLive, ttl);
 
-            long?[] rtts = new long?[probesPerHop];
-            IPAddress hopAddress = null;
-            bool reachedTarget = false;
+            var rtts = new double?[3];
+            IPAddress? hop = null;
+            bool reached = false;
 
-            for (int i = 0; i < probesPerHop; i++)
+            for (int p = 0; p < 3; p++)
             {
-                try
+                var seq = (ushort)Interlocked.Increment(ref _seq);
+                var packet = CreatePacket(seq);
+
+                if (Probe(socket, targetEp, target, packet, seq, out var rtt, out var from, out var isTarget))
                 {
-                    var options = new PingOptions(ttl, true);
-
-                    var sw = Stopwatch.StartNew();
-                    PingReply reply = ping.Send(targetIP, timeoutMs, buffer, options);
-                    sw.Stop();
-
-                    if (reply.Status == IPStatus.Success || reply.Status == IPStatus.TtlExpired)
-                    {
-                        rtts[i] = Math.Max(1, sw.ElapsedMilliseconds);
-
-                        if (reply.Address != null)
-                            hopAddress = reply.Address;
-
-                        if (reply.Status == IPStatus.Success)
-                            reachedTarget = true;
-                    }
-                    else
-                    {
-                        rtts[i] = null;
-                    }
+                    rtts[p] = rtt;
+                    hop ??= from;
+                    if (isTarget) reached = true;
                 }
-                catch
-                {
-                    rtts[i] = null;
-                }
+                Thread.Sleep(10);
             }
 
-            for (int i = 0; i < probesPerHop; i++)
+            PrintHop(ttl, rtts, hop, resolveNames);
+            if (reached) break;
+        }
+    }
+
+    private static bool Probe(Socket socket, IPEndPoint targetEp, IPAddress target, byte[] packet, ushort seq,
+        out double rtt, out IPAddress? from, out bool isTarget)
+    {
+        rtt = 0;
+        from = null;
+        isTarget = false;
+
+        EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+        var buffer = new byte[1024];
+        var sw = Stopwatch.StartNew();
+
+        socket.SendTo(packet, targetEp);
+
+        while (sw.ElapsedMilliseconds < 3000)
+        {
+            try
             {
-                if (rtts[i].HasValue)
-                    Console.Write($"  {rtts[i].Value} ms");
-                else
-                    Console.Write("  *");
+                socket.ReceiveTimeout = 100;
+                int len = socket.ReceiveFrom(buffer, ref remote);
+                var remoteIp = ((IPEndPoint)remote).Address;
+
+                if (MatchReply(buffer, len, seq, out isTarget))
+                {
+                    from = remoteIp;
+                    rtt = sw.Elapsed.TotalMilliseconds;
+                    isTarget = isTarget && remoteIp.Equals(target);
+                    return true;
+                }
             }
+            catch { }
+        }
+        return false;
+    }
 
-            Console.Write("  ");
+    private static bool MatchReply(byte[] buf, int len, ushort expectedSeq, out bool isEchoReply)
+    {
+        isEchoReply = false;
 
-            if (hopAddress != null)
+        if (len < 20) return false;
+
+        int ipHdrLen = (buf[0] & 0x0F) * 4;
+        if (len < ipHdrLen + 8) return false;
+
+        int icmpType = buf[ipHdrLen];
+
+        if (icmpType == 0 && len >= ipHdrLen + 8)
+        {
+            ushort id = (ushort)((buf[ipHdrLen + 4] << 8) | buf[ipHdrLen + 5]);
+            ushort seq = (ushort)((buf[ipHdrLen + 6] << 8) | buf[ipHdrLen + 7]);
+            if (id == _icmpId && seq == expectedSeq)
             {
-                string ip = hopAddress.ToString();
+                isEchoReply = true;
+                return true;
+            }
+        }
 
-                if (resolveNames)
-                {
-                    string name = GetHostname(hopAddress);
+        if (icmpType == 11 && len >= ipHdrLen + 36)
+        {
+            int innerIpStart = ipHdrLen + 8;
+            int innerIpHdrLen = (buf[innerIpStart] & 0x0F) * 4;
+            int innerIcmpStart = innerIpStart + innerIpHdrLen;
 
-                    if (!string.Equals(name, ip, StringComparison.OrdinalIgnoreCase))
-                        Console.WriteLine($"{name} [{ip}]");
-                    else
-                        Console.WriteLine(ip);
-                }
-                else
+            if (innerIcmpStart + 8 <= len && buf[innerIcmpStart] == 8)
+            {
+                ushort id = (ushort)((buf[innerIcmpStart + 4] << 8) | buf[innerIcmpStart + 5]);
+                ushort seq = (ushort)((buf[innerIcmpStart + 6] << 8) | buf[innerIcmpStart + 7]);
+                if (id == _icmpId && seq == expectedSeq)
                 {
-                    Console.WriteLine(ip);
+                    return true;
                 }
             }
+        }
+
+        return false;
+    }
+
+    private static byte[] CreatePacket(ushort seq)
+    {
+        var packet = new byte[32];
+        packet[0] = 8;
+        packet[4] = (byte)(_icmpId >> 8);
+        packet[5] = (byte)(_icmpId & 0xFF);
+        packet[6] = (byte)(seq >> 8);
+        packet[7] = (byte)(seq & 0xFF);
+
+        for (int i = 8; i < 32; i++) packet[i] = (byte)i;
+
+        uint sum = 0;
+        for (int i = 0; i < packet.Length; i += 2)
+            sum += (uint)((packet[i] << 8) | packet[i + 1]);
+        while ((sum >> 16) != 0)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+
+        ushort checksum = (ushort)(~sum);
+        packet[2] = (byte)(checksum >> 8);
+        packet[3] = (byte)(checksum & 0xFF);
+        return packet;
+    }
+
+    private static void PrintHop(int hop, double?[] rtts, IPAddress? address, bool resolve)
+    {
+        Console.Write($"{hop,3}     ");
+        for (int i = 0; i < 3; i++)
+        {
+            if (rtts[i].HasValue)
+                Console.Write($"{(int)Math.Max(1, Math.Round(rtts[i].Value))} ms");
             else
-            {
-                Console.WriteLine("Request timed out.");
-            }
+                Console.Write("*");
 
-            if (reachedTarget)
-                break;
+            if (i < 2) Console.Write("     ");
         }
+        Console.Write("  ");
+
+        if (address == null)
+            Console.WriteLine("Превышен интервал ожидания для запроса.");
+        else if (!resolve)
+            Console.WriteLine(address);
+        else
+            Console.WriteLine($"{GetName(address)} [{address}]");
     }
-    static string GetHostname(IPAddress address)
+
+    private static string GetName(IPAddress ip)
     {
         try
         {
-            return Dns.GetHostEntry(address).HostName;
+            var name = Dns.GetHostEntry(ip).HostName.TrimEnd('.');
+            if (!IPAddress.TryParse(name, out _)) return name;
         }
-        catch
+        catch { }
+
+        var bytes = ip.GetAddressBytes();
+        var sa = new SockAddrIn
         {
-            return address.ToString();
-        }
+            SinFamily = 2,
+            SinAddr = BitConverter.ToUInt32(bytes, 0),
+            SinZero = new byte[8]
+        };
+        var sb = new StringBuilder(1025);
+        if (GetNameInfoW(ref sa, Marshal.SizeOf<SockAddrIn>(), sb, sb.Capacity, null, 0, 0) == 0 && sb.Length > 0)
+            return sb.ToString().TrimEnd('.');
+
+        return ip.ToString();
     }
-    static void PrintHelp()
+
+    [DllImport("ws2_32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetNameInfoW(ref SockAddrIn sa, int salen, StringBuilder host, int hostlen, StringBuilder? serv, int servlen, int flags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SockAddrIn
     {
-        Console.WriteLine("Simple Traceroute Tool");
-        Console.WriteLine("======================");
-        Console.WriteLine();
-        Console.WriteLine("Usage: mytraceroute [target] [options]");
-        Console.WriteLine();
-        Console.WriteLine("Options:");
-        Console.WriteLine("  -n, --resolve-names    Resolve IP addresses to hostnames");
-        Console.WriteLine("  --help, -h             Show this help message");
-        Console.WriteLine();
-        Console.WriteLine("Examples:");
-        Console.WriteLine("  mytraceroute 8.8.8.8");
-        Console.WriteLine("  mytraceroute google.com -n");
+        public ushort SinFamily;
+        public ushort SinPort;
+        public uint SinAddr;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        public byte[] SinZero;
     }
+
+    private static void PrintHelp() => Console.WriteLine(
+        "Использование: mytraceroute <узел> [-d]\n" +
+        "  -d    Не определять имена узлов\n" +
+        "  -?    Справка\n\nТребуются права администратора.");
 }
