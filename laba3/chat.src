@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SocketChat
+{
+    class Program
+    {
+        private static readonly List<Socket> ConnectedClients = new List<Socket>();
+        private static readonly object ListLock = new object();
+
+        static async Task Main(string[] args)
+        {
+            Console.WriteLine("=== ПРОГРАММА ОБМЕНА СООБЩЕНИЯМИ (Socket API) ===");
+            Console.WriteLine("1. Запустить Сервер");
+            Console.WriteLine("2. Запустить Клиент");
+            Console.Write("Выберите режим (1/2): ");
+
+            string choice = Console.ReadLine();
+
+            if (choice == "1")
+            {
+                await RunServer();
+            }
+            else if (choice == "2")
+            {
+                await RunClient();
+            }
+            else
+            {
+                Console.WriteLine("Неверный выбор.");
+            }
+        }
+
+        static async Task RunServer()
+        {
+            Console.Write("Локальный IP сервера: ");
+            string serverIpStr = Console.ReadLine();
+            IPAddress serverIp;
+            if (!IPAddress.TryParse(serverIpStr, out serverIp))
+            {
+                Console.WriteLine("Ошибка IP. Используйте 127.0.0.1 или IP вашей сети.");
+                return;
+            }
+
+            Console.Write("Порт сервера: ");
+            if (!int.TryParse(Console.ReadLine(), out int port)) return;
+
+            Socket serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
+            try
+            {
+                serverSocket.Bind(new IPEndPoint(serverIp, port));
+                serverSocket.Listen(10);
+                Console.WriteLine($"[Server] Запущен на {serverIp}:{port}");
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+            {
+                Console.WriteLine($"[ERROR] Порт {port} уже используется!");
+                return;
+            }
+
+            while (true)
+            {
+                Socket clientSocket = await serverSocket.AcceptAsync();
+                Console.WriteLine($"[Server] Клиент подключен: {clientSocket.RemoteEndPoint}");
+
+                lock (ListLock) { ConnectedClients.Add(clientSocket); }
+
+                _ = HandleClientAsync(clientSocket);
+            }
+        }
+
+        static async Task HandleClientAsync(Socket client)
+        {
+            byte[] buffer = new byte[1024];
+            try
+            {
+                while (true)
+                {
+                    int bytesReceived = await client.ReceiveAsync(buffer, SocketFlags.None);
+                    if (bytesReceived == 0) break;
+
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesReceived);
+                    Console.WriteLine($"[Server] Получено: {message}");
+
+                    lock (ListLock)
+                    {
+                        foreach (Socket c in ConnectedClients)
+                        {
+                            if (c != client && c.Connected)
+                            {
+                                try
+                                {
+                                    c.SendAsync(Encoding.UTF8.GetBytes(message), SocketFlags.None);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                lock (ListLock) { ConnectedClients.Remove(client); }
+                client.Shutdown(SocketShutdown.Both);
+                client.Close();
+                Console.WriteLine("[Server] Клиент отключился.");
+            }
+        }
+
+        static async Task RunClient()
+        {
+            Console.Write("Ваше имя: ");
+            string name = Console.ReadLine();
+
+            Console.Write("Ваш локальный IP (или Enter для авто): ");
+            string clientIpStr = Console.ReadLine();
+            IPAddress clientIp = IPAddress.Any;
+            if (!string.IsNullOrWhiteSpace(clientIpStr) && !IPAddress.TryParse(clientIpStr, out clientIp))
+            {
+                Console.WriteLine("Ошибка IP."); return;
+            }
+
+            Console.Write("IP Сервера: ");
+            string serverIpStr = Console.ReadLine();
+            IPAddress serverIp = IPAddress.Parse(serverIpStr);
+
+            Console.Write("Порт: ");
+            if (!int.TryParse(Console.ReadLine(), out int port)) return;
+
+            Socket clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
+            try
+            {
+                if (clientIp != IPAddress.Any)
+                {
+                    clientSocket.Bind(new IPEndPoint(clientIp, 0));
+                }
+
+                await clientSocket.ConnectAsync(serverIp, port);
+                Console.WriteLine("[Client] Соединение установлено.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Client] Ошибка подключения: {ex.Message}");
+                return;
+            }
+
+            _ = ReceiveLoopAsync(clientSocket);
+
+            while (true)
+            {
+                Console.Write("> ");
+                string msg = Console.ReadLine();
+                if (string.IsNullOrEmpty(msg)) continue;
+                if (msg.ToLower() == "exit") break;
+
+                string fullMsg = $"{name}: {msg}";
+                byte[] data = Encoding.UTF8.GetBytes(fullMsg);
+
+                try { await clientSocket.SendAsync(data, SocketFlags.None); }
+                catch { break; }
+            }
+
+            clientSocket.Shutdown(SocketShutdown.Both);
+            clientSocket.Close();
+        }
+
+        static async Task ReceiveLoopAsync(Socket socket)
+        {
+            byte[] buffer = new byte[1024];
+            while (true)
+            {
+                try
+                {
+                    int bytes = await socket.ReceiveAsync(buffer, SocketFlags.None);
+                    if (bytes == 0) break;
+                    string msg = Encoding.UTF8.GetString(buffer, 0, bytes);
+                    Console.WriteLine($"\n{msg}\n> ");
+                }
+                catch { break; }
+            }
+        }
+    }
+}
